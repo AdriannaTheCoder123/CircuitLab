@@ -5,7 +5,957 @@
     <title>CircuitLab</title>
   </head>
   <body>
-    <!-- This is where your React/App content will appear -->
+   import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Zap, 
+  Lightbulb, 
+  ToggleLeft, 
+  Trash2, 
+  RotateCcw, 
+  Info,
+  Activity,
+  Plus,
+  Play,
+  Pause,
+  Thermometer,
+  MousePointer2,
+  BrainCircuit,
+  Eye,
+  Trophy,
+  Download,
+  CheckCircle2,
+  XCircle,
+  ChevronRight
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { CircuitComponent, ComponentType, SimulationResult, Challenge, ViewMode } from './types';
+import { solveCircuit } from './engine';
+import { analyzeCircuit } from './services/geminiService';
+
+const GRID_SIZE = 40;
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+
+const CHALLENGES: Challenge[] = [
+  {
+    id: 'c1',
+    title: 'The First Spark',
+    description: 'Light up 1 bulb using a 9V battery.',
+    check: (comps, res) => {
+        const hasBattery = comps.some(c => c.type === 'battery');
+        const hasBulb = comps.some(c => c.type === 'bulb');
+        const bulbRes = res?.components.find(r => comps.find(c => c.id === r.id)?.type === 'bulb');
+        return hasBattery && hasBulb && (bulbRes?.power || 0) > 0;
+    }
+  },
+  {
+    id: 'c2',
+    title: 'Ohm\'s Observer',
+    description: 'Create a circuit with exactly 0.90A current.',
+    check: (comps, res) => {
+        const totalI = res?.components.reduce((acc, c) => acc + (comps.find(cmp => cmp.id === c.id)?.type === 'battery' ? 0 : c.current), 0) || 0;
+        return totalI > 0.85 && totalI < 0.95;
+    }
+  },
+  {
+    id: 'c3',
+    title: 'Safety First',
+    description: 'Add a fuse to your circuit to keep it safe!',
+    check: (comps) => comps.some(c => c.type === 'fuse')
+  }
+];
+
+export default function App() {
+  const [components, setComponents] = useState<CircuitComponent[]>([]);
+  const [selectedTool, setSelectedTool] = useState<ComponentType | 'select'>('select');
+  const [dragStart, setDragStart] = useState<{ x: number, y: number } | null>(null);
+  const [mousePos, setMousePos] = useState<{ x: number, y: number }>({ x: 0, y: 0 });
+  const [simResult, setSimResult] = useState<SimulationResult | null>(null);
+  const [isSimulating, setIsSimulating] = useState(true);
+  const [showTutorial, setShowTutorial] = useState(true);
+  const [viewMode, setViewMode] = useState<ViewMode>('realistic');
+  
+  const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [showAiPanel, setShowAiPanel] = useState(false);
+  
+  const [activeChallengeIdx, setActiveChallengeIdx] = useState(0);
+  const [challengeCompleted, setChallengeCompleted] = useState(false);
+
+  const containerRef = useRef<SVGSVGElement>(null);
+
+  useEffect(() => {
+    if (isSimulating) {
+      const result = solveCircuit(components);
+      setSimResult(result);
+    }
+  }, [components, isSimulating]);
+
+  useEffect(() => {
+    const currentChallenge = CHALLENGES[activeChallengeIdx];
+    if (currentChallenge.check(components, simResult)) {
+        setChallengeCompleted(true);
+    } else {
+        setChallengeCompleted(false);
+    }
+  }, [components, simResult, activeChallengeIdx]);
+
+  useEffect(() => {
+    if (isSimulating && simResult) {
+      const blownFuses = components.filter(c => 
+        c.type === 'fuse' && 
+        !c.state && 
+        (simResult.components.find(r => r.id === c.id)?.current || 0) > c.value
+      );
+      
+      if (blownFuses.length > 0) {
+        setComponents(prev => prev.map(c => 
+          blownFuses.some(bf => bf.id === c.id) ? { ...c, state: true } : c
+        ));
+      }
+    }
+  }, [simResult, components, isSimulating]);
+
+  const snapToGrid = (coord: number) => Math.round(coord / GRID_SIZE) * GRID_SIZE;
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = snapToGrid(e.clientX - rect.left);
+    const y = snapToGrid(e.clientY - rect.top);
+
+    if (selectedTool !== 'select') {
+      setDragStart({ x, y });
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = snapToGrid(e.clientX - rect.left);
+    const y = snapToGrid(e.clientY - rect.top);
+    setMousePos({ x, y });
+  };
+
+  const handleMouseUp = () => {
+    if (dragStart && selectedTool !== 'select') {
+      if (dragStart.x === mousePos.x && dragStart.y === mousePos.y) {
+        setDragStart(null);
+        return;
+      }
+
+      let initialValue = 0;
+      if (selectedTool === 'battery') initialValue = 9;
+      else if (selectedTool === 'resistor') initialValue = 10;
+      else if (selectedTool === 'bulb') initialValue = 5;
+      else if (selectedTool === 'fuse') initialValue = 5; // 5A limit
+      else if (selectedTool === 'voltmeter') initialValue = 0; // Displayed V
+      else if (selectedTool === 'ammeter') initialValue = 0; // Displayed A
+
+      const newComponent: CircuitComponent = {
+        id: Math.random().toString(36).substr(2, 9),
+        type: selectedTool as ComponentType,
+        value: initialValue,
+        label: `${selectedTool.charAt(0).toUpperCase() + selectedTool.slice(1)}`,
+        pos1: dragStart,
+        pos2: mousePos,
+        state: (selectedTool === 'switch' || selectedTool === 'fuse') ? false : undefined
+      };
+
+      setComponents([...components, newComponent]);
+      setDragStart(null);
+    }
+  };
+
+  const deleteComponent = (id: string) => {
+    setComponents(components.filter(c => c.id !== id));
+  };
+
+  const toggleSwitch = (id: string) => {
+    setComponents(components.map(c => 
+      c.id === id ? { ...c, state: !c.state } : c
+    ));
+  };
+
+  const updateValue = (id: string, delta: number) => {
+    setComponents(components.map(c => 
+      c.id === id ? { ...c, value: Math.max(1, (c.value || 0) + delta) } : c
+    ));
+  };
+
+  const handleAiAnalysis = async () => {
+    setIsAnalyzing(true);
+    setShowAiPanel(true);
+    const analysis = await analyzeCircuit(components, simResult);
+    setAiAnalysis(analysis);
+    setIsAnalyzing(false);
+  };
+
+  const exportCircuit = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(components));
+    const downloadAnchorNode = document.createElement('a');
+    downloadAnchorNode.setAttribute("href",     dataStr);
+    downloadAnchorNode.setAttribute("download", "my_circuit.json");
+    document.body.appendChild(downloadAnchorNode);
+    downloadAnchorNode.click();
+    downloadAnchorNode.remove();
+  };
+
+  const totalCurrent = simResult?.components.reduce((acc, curr) => acc + curr.current, 0) || 0;
+  const avgVoltage = simResult?.components.find(c => components.find(comp => comp.id === c.id)?.type === 'battery')?.voltageDrop || 0;
+
+  return (
+    <div className="flex flex-col h-screen w-full bg-white font-sans overflow-hidden">
+      {/* Header Section */}
+      <header className="bg-blue-600 px-8 py-4 flex justify-between items-center shadow-lg shrink-0 z-50 border-b-4 border-yellow-400">
+        <div className="flex items-center gap-3">
+          <div className="bg-yellow-400 p-2 rounded-lg shadow-inner">
+            <Zap className="w-6 h-6 text-blue-900 fill-current" />
+          </div>
+          <h1 className="text-2xl font-black text-white tracking-tight">CircuitLab <span className="text-yellow-200 font-medium text-lg">by Adrianna B.</span></h1>
+        </div>
+        <div className="flex gap-4">
+          <button 
+            onClick={() => setViewMode(viewMode === 'realistic' ? 'schematic' : 'realistic')}
+            className="bg-blue-700/50 hover:bg-blue-700 text-white px-4 py-2 rounded-full font-bold flex items-center gap-2 text-xs uppercase tracking-widest border border-blue-400/30 transition-all"
+          >
+             <Eye className="w-4 h-4" /> {viewMode === 'realistic' ? 'Realistic' : 'Schematic'}
+          </button>
+          <button 
+            onClick={handleAiAnalysis}
+            className="bg-yellow-400 text-blue-900 hover:bg-yellow-300 px-4 py-2 rounded-full font-bold flex items-center gap-2 text-xs uppercase tracking-widest shadow-lg transition-all"
+          >
+             <BrainCircuit className="w-4 h-4" /> Lab AI
+          </button>
+          <button 
+            onClick={exportCircuit}
+            className="bg-blue-800 text-white hover:bg-blue-700 p-2 rounded-full transition-colors"
+            title="Export Lab"
+          >
+            <Download className="w-5 h-5" />
+          </button>
+          <button 
+            onClick={() => setComponents([])}
+            className="bg-white text-blue-600 hover:bg-blue-50 px-6 py-2 rounded-full font-bold shadow-md transition-colors text-sm"
+          >
+            Reset Lab
+          </button>
+        </div>
+      </header>
+
+      {/* Main App Layout */}
+      <div className="flex flex-1 overflow-hidden p-6 gap-6">
+        
+        {/* Left Sidebar: Component Library */}
+        <aside className="w-72 bg-slate-50 rounded-3xl shadow-xl border-4 border-blue-100 p-6 flex flex-col gap-6 overflow-hidden">
+          <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-6">
+            <div>
+              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 sticky top-0 bg-slate-50 py-1">Select Tool</h2>
+              <div className="mb-4">
+                 <button 
+                  onClick={() => setSelectedTool('select')}
+                  className={`w-full flex items-center gap-3 p-3 rounded-2xl border-2 transition-all font-bold text-sm ${
+                    selectedTool === 'select' 
+                      ? 'border-blue-600 bg-blue-50 text-blue-900 shadow-sm' 
+                      : 'border-slate-100 hover:border-slate-200 text-slate-500 bg-white'
+                  }`}
+                >
+                    <MousePointer2 className="w-4 h-4" /> Selector
+                </button>
+              </div>
+              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 sticky top-0 bg-slate-50 py-1">Components</h2>
+              <div className="grid grid-cols-2 gap-4">
+                <ComponentTool 
+                  type="battery" 
+                  active={selectedTool === 'battery'} 
+                  onClick={() => setSelectedTool('battery')}
+                  colors="blue"
+                >
+                  <div className="w-10 h-6 border-2 border-slate-800 rounded relative mb-2 flex items-center justify-center text-[10px] font-bold">+ | -</div>
+                  <span className="text-xs font-bold font-mono">Battery</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="wire" 
+                  active={selectedTool === 'wire'} 
+                  onClick={() => setSelectedTool('wire')}
+                  colors="blue"
+                >
+                  <div className="w-10 h-1 bg-blue-600 rounded-full mb-4"></div>
+                  <span className="text-xs font-bold font-mono">Wire</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="bulb" 
+                  active={selectedTool === 'bulb'} 
+                  onClick={() => setSelectedTool('bulb')}
+                  colors="amber"
+                >
+                  <div className="w-8 h-8 rounded-full border-2 border-slate-800 mb-2 flex items-center justify-center">
+                    <div className="w-4 h-4 rounded-full bg-yellow-400 opacity-50"></div>
+                  </div>
+                  <span className="text-xs font-bold font-mono">Bulb</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="resistor" 
+                  active={selectedTool === 'resistor'} 
+                  onClick={() => setSelectedTool('resistor')}
+                  colors="red"
+                >
+                  <div className="w-10 h-4 border-2 border-slate-800 rounded-sm mb-2 flex flex-col justify-between">
+                     <div className="flex justify-around h-full"><div className="w-1 bg-red-500"></div><div className="w-1 bg-blue-500"></div><div className="w-1 bg-yellow-500"></div></div>
+                  </div>
+                  <span className="text-xs font-bold font-mono">Resistor</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="switch" 
+                  active={selectedTool === 'switch'} 
+                  onClick={() => setSelectedTool('switch')}
+                  colors="green"
+                >
+                  <div className="w-10 h-1 bg-slate-800 mb-4 transform -rotate-45 relative"></div>
+                  <span className="text-xs font-bold font-mono">Switch</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="voltmeter" 
+                  active={selectedTool === 'voltmeter'} 
+                  onClick={() => setSelectedTool('voltmeter')}
+                  colors="blue"
+                >
+                  <div className="w-8 h-8 rounded border-2 border-slate-800 mb-2 flex items-center justify-center font-bold text-lg">V</div>
+                  <span className="text-xs font-bold font-mono">Voltmeter</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="ammeter" 
+                  active={selectedTool === 'ammeter'} 
+                  onClick={() => setSelectedTool('ammeter')}
+                  colors="blue"
+                >
+                  <div className="w-8 h-8 rounded-full border-2 border-slate-800 mb-2 flex items-center justify-center font-bold text-lg">A</div>
+                  <span className="text-xs font-bold font-mono">Ammeter</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="fuse" 
+                  active={selectedTool === 'fuse'} 
+                  onClick={() => setSelectedTool('fuse')}
+                  colors="red"
+                >
+                  <div className="w-8 h-4 border-2 border-slate-800 rounded-full mb-2 flex items-center justify-center">
+                     <div className="w-4 h-0.5 bg-slate-800"></div>
+                  </div>
+                  <span className="text-xs font-bold font-mono">Fuse</span>
+                </ComponentTool>
+
+                <ComponentTool 
+                  type="ground" 
+                  active={selectedTool === 'ground'} 
+                  onClick={() => setSelectedTool('ground')}
+                  colors="green"
+                >
+                  <div className="flex flex-col items-center mb-2">
+                     <div className="w-4 h-0.5 bg-slate-800 mb-0.5"></div>
+                     <div className="w-3 h-0.5 bg-slate-800 mb-0.5"></div>
+                     <div className="w-2 h-0.5 bg-slate-800"></div>
+                  </div>
+                  <span className="text-xs font-bold font-mono">Ground</span>
+                </ComponentTool>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-auto bg-blue-50 p-4 rounded-2xl border border-blue-100 shrink-0">
+            <h3 className="text-sm font-bold text-blue-900 mb-2 italic flex items-center gap-2">
+              <Info className="w-4 h-4" /> Lab Tip!
+            </h3>
+            <p className="text-[11px] text-blue-700 leading-relaxed font-medium">Scroll down to see all components like Voltmeters and Fuses.</p>
+          </div>
+        </aside>
+
+        {/* Center: Interactive Workspace */}
+        <main 
+          className="flex-1 bg-white rounded-3xl shadow-2xl relative border-4 border-blue-100 overflow-hidden flex items-center justify-center" 
+          style={{ backgroundImage: 'radial-gradient(#d1d5db 1.5px, transparent 1.5px)', backgroundSize: '30px 30px' }}
+        >
+          {/* Legend Overlay */}
+          <div className="absolute top-6 left-6 flex gap-3 z-10">
+          </div>
+
+          <svg 
+              ref={containerRef}
+              width={CANVAS_WIDTH}
+              height={CANVAS_HEIGHT}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              className="cursor-crosshair overflow-visible touch-none"
+            >
+              {/* Grid Nodes Visualization */}
+               {Array.from({ length: CANVAS_WIDTH / GRID_SIZE + 1 }).map((_, i) => (
+                Array.from({ length: CANVAS_HEIGHT / GRID_SIZE + 1 }).map((_, j) => (
+                  <circle 
+                    key={`node-${i}-${j}`} 
+                    cx={i * GRID_SIZE} 
+                    cy={j * GRID_SIZE} 
+                    r={1.5} 
+                    fill="#e2e8f0" 
+                    className="pointer-events-none"
+                  />
+                ))
+              ))}
+
+              {/* Ghost Line (Placement Helper) */}
+              {dragStart && (
+                <line 
+                  x1={dragStart.x} 
+                  y1={dragStart.y} 
+                  x2={mousePos.x} 
+                  y2={mousePos.y} 
+                  stroke="#2563eb" 
+                  strokeWidth="4" 
+                  strokeDasharray="10,5"
+                  opacity="0.4"
+                />
+              )}
+
+              {/* Components */}
+              {components.map(comp => (
+                <ComponentView 
+                  key={comp.id} 
+                  comp={comp} 
+                  viewMode={viewMode}
+                  onDelete={() => deleteComponent(comp.id)}
+                  onToggle={() => toggleSwitch(comp.id)}
+                  onValueChange={(delta) => updateValue(comp.id, delta)}
+                  simData={simResult?.components.find(r => r.id === comp.id)}
+                />
+              ))}
+
+              {/* Electron Particles */}
+              <AnimatePresence>
+                {isSimulating && simResult?.components.map(res => {
+                    if (res.current <= 0.01) return null;
+                    const comp = components.find(c => c.id === res.id);
+                    if (!comp) return null;
+                    
+                    return (
+                        <ElectronFlow 
+                            key={`flow-${res.id}`} 
+                            comp={comp} 
+                            intensity={res.current} 
+                        />
+                    );
+                })}
+              </AnimatePresence>
+            </svg>
+
+          {/* Control Pad Overlay */}
+          <div className="absolute bottom-10 left-1/2 -translate-x-1/2 bg-blue-900 rounded-3xl px-8 py-5 flex gap-8 shadow-2xl items-center text-white z-20 border border-blue-700">
+            <div className="flex flex-col items-center gap-2">
+              <span className="text-[9px] uppercase font-black text-blue-400 tracking-widest">Sim Logic</span>
+              <button 
+                onClick={() => setIsSimulating(!isSimulating)}
+                className={`w-14 h-7 rounded-full relative transition-colors duration-300 ${isSimulating ? 'bg-yellow-400' : 'bg-slate-700'}`}
+              >
+                <motion.div 
+                  animate={{ x: isSimulating ? 28 : 4 }}
+                  className="absolute top-1 w-5 h-5 bg-white rounded-full shadow-md"
+                />
+              </button>
+            </div>
+            <div className="h-10 w-px bg-blue-700"></div>
+            <div className="flex gap-6">
+              <button 
+                onClick={() => setShowTutorial(true)}
+                className="p-3 hover:bg-blue-800 rounded-2xl text-blue-300"
+              >
+                <Info className="w-5 h-5" />
+              </button>
+              <button 
+                onClick={() => setComponents([])}
+                className="p-3 bg-red-500/20 hover:bg-red-500/40 text-red-500 rounded-2xl transition-colors"
+                title="Clear Everything"
+              >
+                <Trash2 className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+        </main>
+
+        {/* Right Sidebar: Diagnostics & Challenges */}
+        <aside className="w-80 flex flex-col gap-6 overflow-y-auto pr-2 custom-scrollbar">
+          {/* Challenge Box */}
+          <div className="bg-white rounded-3xl p-6 shadow-xl border-4 border-yellow-100 flex flex-col gap-4">
+             <div className="flex justify-between items-center">
+                <h2 className="text-[10px] font-black uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                   <Trophy className="w-3 h-3 text-yellow-500" /> Active Goal
+                </h2>
+                <div className="text-[10px] font-bold text-slate-400">{activeChallengeIdx + 1}/{CHALLENGES.length}</div>
+             </div>
+             <div>
+                <p className="text-lg font-black text-slate-900 leading-tight mb-1">{CHALLENGES[activeChallengeIdx].title}</p>
+                <p className="text-xs text-slate-500 font-medium">{CHALLENGES[activeChallengeIdx].description}</p>
+             </div>
+             
+             <div className="flex items-center gap-2 py-2">
+                {challengeCompleted ? (
+                    <div className="flex items-center gap-2 text-emerald-600 font-black text-xs uppercase animate-bounce">
+                        <CheckCircle2 className="w-4 h-4" /> Challenge Met!
+                    </div>
+                ) : (
+                    <div className="flex items-center gap-2 text-slate-300 font-black text-xs uppercase">
+                        <RotateCcw className="w-4 h-4 animate-spin-slow" /> Working on it...
+                    </div>
+                )}
+             </div>
+
+             <button 
+                disabled={!challengeCompleted}
+                onClick={() => {
+                    setActiveChallengeIdx((prev) => (prev + 1) % CHALLENGES.length);
+                    setChallengeCompleted(false);
+                }}
+                className={`w-full py-3 rounded-2xl font-black uppercase tracking-widest text-xs flex items-center justify-center gap-2 transition-all ${
+                    challengeCompleted 
+                        ? 'bg-yellow-400 text-blue-900 shadow-xl shadow-yellow-200' 
+                        : 'bg-slate-100 text-slate-300 cursor-not-allowed'
+                }`}
+             >
+                {activeChallengeIdx === CHALLENGES.length - 1 ? 'Finish Lab' : 'Next Mission'} <ChevronRight className="w-4 h-4" />
+             </button>
+          </div>
+
+          <div className="bg-blue-600 rounded-3xl p-7 shadow-xl text-white flex flex-col border-4 border-blue-400">
+            <h2 className="text-[10px] font-black uppercase tracking-widest mb-6 text-blue-100 flex items-center gap-2">
+               <Activity className="w-4 h-4" /> Lab Feed
+            </h2>
+            <div className="flex flex-col gap-8">
+              <div className="flex justify-between items-center bg-blue-700/50 p-4 rounded-2xl border border-blue-400/30">
+                <div className="text-center flex-1">
+                  <motion.div 
+                    key={totalCurrent}
+                    initial={{ scale: 1.1 }}
+                    animate={{ scale: 1 }}
+                    className="text-4xl font-black leading-none tracking-tighter text-yellow-400"
+                  >
+                    {totalCurrent.toFixed(2)}
+                  </motion.div>
+                  <div className="text-[8px] font-black uppercase tracking-wider text-blue-100 opacity-70 mt-1">Amps (I)</div>
+                </div>
+                <div className="w-px h-8 bg-white/20 mx-4"></div>
+                <div className="text-center flex-1">
+                  <div className="text-4xl font-black leading-none tracking-tighter">{avgVoltage.toFixed(1)}</div>
+                  <div className="text-[8px] font-black uppercase tracking-wider text-blue-100 opacity-70 mt-1">Volts (V)</div>
+                </div>
+              </div>
+
+              {/* Individual Component Stats */}
+              <div className="space-y-3">
+                 <h3 className="text-[9px] font-black uppercase tracking-widest text-blue-200 opacity-50">Live Readings</h3>
+                 {components.filter(c => c.type !== 'wire' && c.type !== 'ground').length === 0 ? (
+                    <div className="text-[10px] italic text-blue-200/50 py-4 text-center border-2 border-dashed border-blue-400/30 rounded-xl">
+                      Waiting for components...
+                    </div>
+                 ) : (
+                    components.filter(c => c.type !== 'wire' && c.type !== 'ground').map(comp => {
+                        const res = simResult?.components.find(r => r.id === comp.id);
+                        return (
+                           <div key={`feed-${comp.id}`} className="bg-white/10 hover:bg-white/20 transition-colors p-3 rounded-xl border border-white/10 flex justify-between items-center group">
+                              <div>
+                                 <div className="text-[10px] font-black uppercase tracking-tight">{comp.type}</div>
+                                 <div className="text-[9px] font-mono opacity-60">ID: {comp.id.slice(0, 4)}</div>
+                              </div>
+                              <div className="text-right">
+                                 <div className="text-xs font-black">{res?.current.toFixed(2)}A</div>
+                                 <div className="text-[9px] font-mono opacity-60">{res?.voltageDrop.toFixed(1)}V</div>
+                              </div>
+                           </div>
+                        );
+                    })
+                 )}
+              </div>
+            </div>
+            
+            <div className="mt-8 bg-white/20 p-4 rounded-2xl backdrop-blur-sm border border-white/20">
+               <p className="text-[10px] font-bold uppercase tracking-tight flex items-center gap-2">
+                 <Zap className={`w-3 h-3 ${totalCurrent > 0 ? 'text-yellow-400 animate-pulse' : 'text-blue-300'}`} /> 
+                 {totalCurrent > 0 ? 'Optimal Flow detected' : 'Incomplete Loop'}
+               </p>
+            </div>
+          </div>
+
+          <div className="bg-blue-900 rounded-3xl p-7 shadow-xl text-white border-4 border-blue-950">
+            <h2 className="text-[10px] font-black uppercase tracking-widest mb-4 text-blue-300">Symbol Key</h2>
+            <ul className="space-y-4">
+              <li className="flex items-center gap-3 text-[11px] font-black uppercase">
+                <span className="w-3 h-3 bg-yellow-400 rounded-full shadow-[0_0_10px_rgba(250,204,21,0.5)]"></span> Load Device
+              </li>
+              <li className="flex items-center gap-3 text-[11px] font-black uppercase">
+                <span className="w-3 h-3 bg-emerald-400 rounded-full"></span> Control Switch
+              </li>
+              <li className="flex items-center gap-3 text-[11px] font-black uppercase">
+                <span className="w-3 h-3 bg-blue-500 rounded-full border border-blue-400"></span> Conductive Wire
+              </li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+
+      {/* Footer Ticker */}
+      <footer className="bg-blue-950 text-blue-400 py-3 px-8 flex justify-between text-[9px] font-mono tracking-[0.2em] z-50 uppercase font-bold">
+        <div className="flex gap-4">
+          <span>CORE_CPU: ACTIVE</span>
+          <span className="opacity-40">|</span>
+          <span>PHYSICS_ENGINE: REX_SIM_v2</span>
+        </div>
+        <div className="flex gap-4">
+          <span className="animate-pulse text-yellow-500">SENSORS_OK</span>
+          <span className="opacity-40">|</span>
+          <span>Adrianna_Science_Project_2026</span>
+        </div>
+      </footer>
+
+      {/* AI Side Drawer */}
+      <AnimatePresence>
+        {showAiPanel && (
+            <>
+                <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    onClick={() => setShowAiPanel(false)}
+                    className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[110]" 
+                />
+                <motion.div 
+                    initial={{ x: '100%' }}
+                    animate={{ x: 0 }}
+                    exit={{ x: '100%' }}
+                    transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+                    className="fixed top-0 right-0 h-full w-96 bg-white z-[120] shadow-[-20px_0_40px_rgba(0,0,0,0.1)] flex flex-col p-8"
+                >
+                    <div className="flex justify-between items-center mb-8">
+                        <div className="bg-blue-50 p-2 rounded-xl text-blue-600">
+                            <BrainCircuit className="w-6 h-6" />
+                        </div>
+                        <button onClick={() => setShowAiPanel(false)} className="p-2 hover:bg-slate-100 rounded-full text-slate-400">
+                             <Trash2 className="w-5 h-5 translate-y-[2px]" /> {/* Using trash as close icon for simplicity if X is missing */}
+                        </button>
+                    </div>
+                    
+                    <h2 className="text-2xl font-black text-slate-900 tracking-tighter mb-2">Lab Assistant</h2>
+                    <p className="text-sm text-slate-500 font-medium mb-8 leading-relaxed">Adrianna's personal physics guide. Let's see what your circuit is doing!</p>
+                    
+                    <div className="flex-1 bg-slate-50 rounded-3xl p-6 overflow-y-auto border-2 border-slate-100">
+                        {isAnalyzing ? (
+                            <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
+                                <motion.div 
+                                    animate={{ rotate: 360 }}
+                                    transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                                    className="p-4 bg-yellow-100 rounded-full text-yellow-600"
+                                >
+                                    <BrainCircuit className="w-8 h-8" />
+                                </motion.div>
+                                <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Analyzing Physics...</p>
+                            </div>
+                        ) : (
+                            <div className="text-slate-700 font-medium leading-relaxed prose prose-slate">
+                                <AnimatePresence mode="wait">
+                                    <motion.div 
+                                        key={aiAnalysis}
+                                        initial={{ opacity: 0, y: 10 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        className="whitespace-pre-wrap"
+                                    >
+                                        {aiAnalysis || "I'm ready when you are! Click the 'Ask AI' button to start an analysis."}
+                                    </motion.div>
+                                </AnimatePresence>
+                            </div>
+                        )}
+                    </div>
+                    
+                    {!isAnalyzing && (
+                        <button 
+                            onClick={handleAiAnalysis}
+                            className="mt-6 w-full py-4 bg-blue-600 text-white rounded-2xl font-black uppercase tracking-widest hover:bg-blue-700 transition-all shadow-xl shadow-blue-100"
+                        >
+                            Refresh Analysis
+                        </button>
+                    )}
+                </motion.div>
+            </>
+        )}
+      </AnimatePresence>
+
+      {/* Tutorial Overlay */}
+      {showTutorial && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-sm">
+            <motion.div 
+               initial={{ scale: 0.9, opacity: 0 }}
+               animate={{ scale: 1, opacity: 1 }}
+               className="bg-white rounded-[2.5rem] border-8 border-blue-100 max-w-lg w-full shadow-2xl p-10 overflow-hidden relative"
+            >
+                <div className="absolute top-0 left-0 w-full h-2 bg-blue-600" />
+                <div className="flex justify-between items-start mb-8 text-blue-900">
+                    <h2 className="text-3xl font-black tracking-tighter uppercase italic">Ready to Explore?</h2>
+                    <button onClick={() => setShowTutorial(false)} className="p-2 hover:bg-slate-100 rounded-full text-slate-400 transition-colors">
+                        <Trash2 className="w-6 h-6" />
+                    </button>
+                </div>
+                <div className="space-y-6">
+                    <StepCard num="1" title="Select a tool" text="Pick a Component (Battery, Resistor, Ammeter...) from the sidebar." />
+                    <StepCard num="2" title="Draw connections" text="Click and drag between dots. Use wires to bridge gaps." />
+                    <StepCard num="3" title="Measurement" text="Add Voltmeters and Ammeters to see real-time physics data!" />
+                    <StepCard num="4" title="Safety First" text="Use Ground and Fuse to protect your circuit from shorts." />
+                </div>
+                <button 
+                  onClick={() => setShowTutorial(false)}
+                  className="w-full mt-10 bg-blue-600 text-white py-5 rounded-2xl font-black uppercase tracking-widest hover:bg-blue-700 transition-all shadow-xl shadow-blue-200"
+                >
+                    Initialize Lab
+                </button>
+            </motion.div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComponentTool({ active, onClick, children, colors }: any) {
+  const colorMap: any = {
+    blue: 'hover:border-blue-400 hover:bg-blue-50 text-blue-600',
+    amber: 'hover:border-amber-400 hover:bg-amber-50 text-amber-600',
+    green: 'hover:border-green-400 hover:bg-green-50 text-green-600',
+    red: 'hover:border-red-400 hover:bg-red-50 text-red-600',
+  };
+
+  const activeMap: any = {
+    blue: 'border-blue-400 bg-blue-50 shadow-inner',
+    amber: 'border-amber-400 bg-amber-50 shadow-inner',
+    green: 'border-green-400 bg-green-50 shadow-inner',
+    red: 'border-red-400 bg-red-50 shadow-inner',
+  };
+
+  return (
+    <button 
+      onClick={onClick}
+      className={`p-4 bg-slate-50 border-2 border-dashed border-slate-200 rounded-[1.5rem] flex flex-col items-center justify-center cursor-pointer transition-all ${
+        active ? activeMap[colors] : colorMap[colors]
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+
+function StepCard({ num, title, text }: any) {
+    return (
+        <div className="flex gap-4">
+            <div className="w-6 h-6 rounded-full bg-[#141414] text-white flex items-center justify-center text-xs font-bold shrink-0">{num}</div>
+            <div>
+                <div className="text-sm font-bold uppercase tracking-widest mb-1">{title}</div>
+                <p className="text-xs text-gray-600">{text}</p>
+            </div>
+        </div>
+    );
+}
+
+function ComponentView({ comp, viewMode, onDelete, onToggle, onValueChange, simData }: any) {
+  const { pos1, pos2 } = comp;
+  const length = Math.sqrt(Math.pow(pos2.x - pos1.x, 2) + Math.pow(pos2.y - pos1.y, 2));
+  const angle = Math.atan2(pos2.y - pos1.y, pos2.x - pos1.x) * (180 / Math.PI);
+  const midX = (pos1.x + pos2.x) / 2;
+  const midY = (pos1.y + pos2.y) / 2;
+
+  const currentIntensity = simData?.current || 0;
+  const isSchematic = viewMode === 'schematic';
+
+  return (
+    <g className="group cursor-pointer">
+       {/* Transparent hit area for wires */}
+      <line 
+        x1={pos1.x} y1={pos1.y} x2={pos2.x} y2={pos2.y} 
+        stroke="transparent" strokeWidth="20" 
+        onClick={(e) => { e.stopPropagation(); onDelete(); }}
+      />
+      
+      {/* Main wire connection */}
+      <line 
+        x1={pos1.x} y1={pos1.y} x2={pos2.x} y2={pos2.y} 
+        stroke={currentIntensity > 0.01 ? (isSchematic ? "#2563eb" : "#3b82f6") : (isSchematic ? "#64748b" : "#141414")} 
+        strokeWidth={isSchematic ? "2" : "3"} 
+        strokeLinecap="round"
+        className="transition-colors duration-500"
+      />
+
+      {/* Component Symbol Container */}
+      <g transform={`translate(${midX}, ${midY}) rotate(${angle})`}>
+        {comp.type === 'battery' && (
+          <g>
+            {isSchematic ? (
+                <g>
+                    <line x1="-8" y1="-10" x2="-8" y2="10" stroke="#1e293b" strokeWidth="2" />
+                    <line x1="-3" y1="-5" x2="-3" y2="5" stroke="#1e293b" strokeWidth="2" />
+                    <line x1="2" y1="-10" x2="2" y2="10" stroke="#1e293b" strokeWidth="2" />
+                    <line x1="7" y1="-5" x2="7" y2="5" stroke="#1e293b" strokeWidth="2" />
+                </g>
+            ) : (
+                <g>
+                    <rect x="-15" y="-10" width="30" height="20" fill="white" stroke="#1e293b" strokeWidth="2" rx="2" />
+                    <line x1="-5" y1="-6" x2="-5" y2="6" stroke="#1e293b" strokeWidth="3" />
+                    <line x1="5" y1="-10" x2="5" y2="10" stroke="#1e293b" strokeWidth="3" />
+                </g>
+            )}
+            <text x="0" y="-18" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-[#1e293b] font-mono tracking-tighter" transform={`rotate(${-angle})`}>{comp.value}V</text>
+            {!isSchematic && (
+               <>
+                 <circle cx="-13" cy="0" r="4" fill="#3b82f6" />
+                 <circle cx="13" cy="0" r="4" fill="#1e293b" />
+               </>
+            )}
+          </g>
+        )}
+
+        {comp.type === 'resistor' && (
+          <g onClick={() => onValueChange(5)}>
+             {isSchematic ? (
+                 <path d="M-15 0 L-12 -6 L-9 6 L-6 -6 L-3 6 L0 -6 L3 6 L6 -6 L9 6 L12 -6 L15 0" fill="none" stroke="#1e293b" strokeWidth="1.5" />
+             ) : (
+                <>
+                    <rect x="-15" y="-6" width="30" height="12" fill="white" stroke="#1e293b" strokeWidth="2" />
+                    <path d="M-15 0 L-10 -4 L-5 4 L0 -4 L5 4 L10 -4 L15 0" fill="none" stroke="#ef4444" strokeWidth="1.5" />
+                </>
+             )}
+             <text x="0" y="-18" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-slate-900 font-mono" transform={`rotate(${-angle})`}>{comp.value}Ω</text>
+          </g>
+        )}
+
+        {comp.type === 'bulb' && (
+          <g onClick={() => onValueChange(5)}>
+            <circle r="12" fill="white" stroke="#1e293b" strokeWidth="2" />
+            <AnimatePresence>
+                {simData?.power > 0 && (
+                    <motion.circle 
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: Math.min(simData.power / 20, 1), scale: 1 }}
+                        r="18" fill="rgba(251, 191, 36, 0.3)" filter="blur(4px)" 
+                    />
+                )}
+            </AnimatePresence>
+            {isSchematic ? (
+                 <g>
+                    <path d="M-6 -6 Q 0 0 6 -6 M-6 6 Q 0 0 6 6" fill="none" stroke="#1e293b" strokeWidth="1.5" />
+                 </g>
+            ) : (
+                <path d="M-6 -6 L6 6 M-6 6 L6 -6" stroke="#1e293b" strokeWidth="1.5" />
+            )}
+            <text x="0" y="-20" textAnchor="middle" fontSize="10" font-black className="fill-slate-900 font-mono" transform={`rotate(${-angle})`}>BULB</text>
+          </g>
+        )}
+
+        {comp.type === 'voltmeter' && (
+          <g>
+             <circle r="12" fill="white" stroke="#1e293b" strokeWidth={isSchematic ? "1.5" : "2"} />
+             {!isSchematic && <rect x="-15" y="-12" width="30" height="24" fill="white" stroke="#1e293b" strokeWidth="2" rx="4" />}
+             <text x="0" y="4" textAnchor="middle" fontSize={isSchematic ? "12" : "14"} fontWeight="black" fill="#1e293b">V</text>
+             <text x="0" y="-20" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-indigo-600 font-mono" transform={`rotate(${-angle})`}>{simData?.voltageDrop.toFixed(2)}V</text>
+          </g>
+        )}
+
+        {comp.type === 'ammeter' && (
+          <g>
+             <circle r="12" fill="white" stroke="#1e293b" strokeWidth={isSchematic ? "1.5" : "2"} />
+             <text x="0" y="4" textAnchor="middle" fontSize={isSchematic ? "12" : "14"} fontWeight="black" fill="#1e293b">A</text>
+             <text x="0" y="-20" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-emerald-600 font-mono" transform={`rotate(${-angle})`}>{simData?.current.toFixed(2)}A</text>
+          </g>
+        )}
+
+        {comp.type === 'fuse' && (
+          <g onClick={() => onValueChange(1)}>
+             {isSchematic ? (
+                <path d="M-15 0 L-10 0 C-5 -10, 5 10, 10 0 L15 0" fill="none" stroke="#1e293b" strokeWidth="1.5" />
+             ) : (
+                <rect x="-15" y="-6" width="30" height="12" rx="6" fill="white" stroke="#1e293b" strokeWidth="2" />
+             )}
+             {!comp.state && !isSchematic ? (
+               <line x1="-10" y1="0" x2="10" y2="0" stroke="#ef4444" strokeWidth="1.5" />
+             ) : (comp.state && (
+               <g>
+                 <line x1="-10" y1="0" x2="-2" y2="-2" stroke="#ef4444" strokeWidth="1.5" />
+                 <line x1="10" y1="0" x2="2" y2="2" stroke="#ef4444" strokeWidth="1.5" />
+               </g>
+             ))}
+             <text x="0" y="-20" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-red-600 font-mono" transform={`rotate(${-angle})`}>{comp.value}A {comp.state ? 'BLOWN' : 'FUSE'}</text>
+          </g>
+        )}
+
+        {comp.type === 'ground' && (
+          <g>
+             <line x1="0" y1="-10" x2="0" y2="0" stroke="#1e293b" strokeWidth="2" />
+             <line x1="-10" y1="0" x2="10" y2="0" stroke="#1e293b" strokeWidth="2" />
+             <line x1="-6" y1="4" x2="6" y2="4" stroke="#1e293b" strokeWidth="1.5" />
+             <line x1="-2" y1="8" x2="2" y2="8" stroke="#1e293b" strokeWidth="1" />
+          </g>
+        )}
+
+        {comp.type === 'switch' && (
+          <g onClick={(e) => { e.stopPropagation(); onToggle(); }}>
+             <circle cx="-12" cy="0" r="2" fill="#1e293b" />
+             <circle cx="12" cy="0" r="2" fill="#1e293b" />
+             <motion.line 
+                animate={{ x2: comp.state ? 12 : 12, y2: comp.state ? 0 : -12 }}
+                x1="-12" y1="0" stroke={comp.state ? "#10b981" : "#1e293b"} strokeWidth={isSchematic ? "2" : "4"} 
+             />
+             <text x="0" y="-20" textAnchor="middle" fontSize="10" fontWeight="bold" className="fill-emerald-700 font-mono uppercase" transform={`rotate(${-angle})`}>
+                {comp.state ? 'Closed' : 'Open'}
+             </text>
+          </g>
+        )}
+      </g>
+    </g>
+  );
+}
+
+function ElectronFlow({ comp, intensity }: any) {
+    const { pos1, pos2 } = comp;
+    // Normalize intensity for visual speed [0.1, 1.0]
+    const speed = Math.max(0.5, Math.min(3, intensity * 2));
+    const dotsCount = Math.floor(Math.sqrt(Math.pow(pos2.x - pos1.x, 2) + Math.pow(pos2.y - pos1.y, 2)) / 20);
+
+    return (
+        <g>
+            {Array.from({ length: dotsCount }).map((_, i) => (
+                <motion.circle
+                    key={`${comp.id}-dot-${i}`}
+                    r="2"
+                    fill="#3b82f6"
+                    initial={{ offsetDistance: `${(i / dotsCount) * 100}%` }}
+                    animate={{ 
+                        offsetDistance: "100%",
+                        opacity: [1, 0.8, 1]
+                    }}
+                    transition={{
+                        offsetDistance: {
+                            duration: 2 / speed,
+                            repeat: Infinity,
+                            ease: "linear",
+                            delay: (i / dotsCount) * (2 / speed)
+                        },
+                        opacity: { repeat: Infinity, duration: 1 }
+                    }}
+                    style={{
+                        offsetPath: `path('M ${pos1.x} ${pos1.y} L ${pos2.x} ${pos2.y}')`,
+                        offsetRotate: "auto"
+                    }}
+                />
+            ))}
+        </g>
+    );
+}
     <div id="root"></div>
 
     <!-- Link to your app logic -->
